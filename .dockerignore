@@ -1,0 +1,15 @@
+.git/
+.github/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+faiss_index/
+mlruns/
+tests/
+k8s/
+README.md
