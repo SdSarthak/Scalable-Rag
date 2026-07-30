@@ -1,1 +1,49 @@
-﻿.env
+# secrets and local config
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials.json
+serviceAccount*.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+env/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# node (tooling only)
+node_modules/
+
+# build artefacts
+dist/
+build/
+
+# indexes, checkpoints and data
+faiss_index/
+*.faiss
+*.h5
+*.pt
+*.pkl
+*.ckpt
+*.sqlite3
+mlruns/
+mlflow.db
+data/
+*.csv
+*.parquet
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
