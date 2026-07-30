@@ -2,13 +2,59 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rag-system
+  labels:
+    app: rag-system
 spec:
   replicas: 3
+  selector:
+    matchLabels:
+      app: rag-system
   template:
+    metadata:
+      labels:
+        app: rag-system
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8000"
     spec:
       containers:
-      - name: rag-system
-        image: rag-system:latest
-        resources:
-          limits:
-            nvidia.com/gpu: 1  # If using GPU
+        - name: rag-system
+          image: rag-system:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: rag-system-config
+            - secretRef:
+                name: rag-system-secrets
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: faiss-index
+              mountPath: /app/faiss_index
+              readOnly: true
+      volumes:
+        # The index is built by `python ingest.py` and shared read-only across pods.
+        - name: faiss-index
+          persistentVolumeClaim:
+            claimName: rag-faiss-index

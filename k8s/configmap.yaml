@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-system-config
+data:
+  LOG_LEVEL: "INFO"
+  LLM_MODEL: "gpt-4o-mini"
+  EMBEDDING_MODEL: "text-embedding-3-small"
+  DOCUMENT_SOURCE: "s3"
+  S3_PREFIX: "docs/"
+  AWS_REGION: "us-east-1"
+  CHUNK_SIZE: "1000"
+  CHUNK_OVERLAP: "200"
+  INDEX_PATH: "/app/faiss_index"
+  RETRIEVAL_K: "5"
+  AUTH_ENABLED: "true"
+  JWT_ALGORITHM: "RS256"
+  MLFLOW_ENABLED: "true"
+  MLFLOW_EXPERIMENT: "scalable-rag"
+---
+# Create the secret out-of-band, e.g.
+#   kubectl create secret generic rag-system-secrets \
+#     --from-literal=OPENAI_API_KEY=... \
+#     --from-literal=S3_BUCKET_NAME=... \
+#     --from-literal=JWT_JWKS_URL=... \
+#     --from-literal=JWT_AUDIENCE=... \
+#     --from-literal=JWT_ISSUER=... \
+#     --from-literal=MLFLOW_TRACKING_URI=...
+# The manifest below documents the expected keys; it holds no real values.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rag-system-secrets
+type: Opaque
+stringData:
+  OPENAI_API_KEY: "REPLACE_ME"
+  S3_BUCKET_NAME: "REPLACE_ME"
+  JWT_JWKS_URL: "REPLACE_ME"
+  JWT_AUDIENCE: "REPLACE_ME"
+  JWT_ISSUER: "REPLACE_ME"
+  MLFLOW_TRACKING_URI: "REPLACE_ME"
