@@ -1,11 +1,20 @@
+import asyncio
+import threading
+import time
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import main
 from config import get_settings
 from conftest import make_settings
-from main import app
+from main import MAX_QUESTION_CHARS, app
 from retrieval_chain import get_retrieval_service
 from vector_store import VectorStoreNotFound
+
+#: How long the stubbed retrieval call blocks for in the concurrency test.
+SLOW_QUERY_SECONDS = 3.0
 
 
 class StubService:
@@ -106,6 +115,67 @@ def test_query_returns_502_when_the_provider_fails():
     response = build_client(service).post("/query", json={"question": "q"})
     assert response.status_code == 502
     assert "openai timeout" not in response.text  # upstream detail is not leaked
+
+
+def test_query_rejects_an_oversized_question_at_the_parser():
+    response = build_client().post("/query", json={"question": "x" * (MAX_QUESTION_CHARS + 1)})
+    assert response.status_code == 422
+
+
+def test_query_traces_to_mlflow_after_the_response(monkeypatch):
+    logged = []
+    monkeypatch.setattr(main, "log_query", lambda *a, **kw: logged.append(a))
+
+    response = build_client().post("/query", json={"question": "what?"})
+
+    assert response.status_code == 200
+    assert logged and logged[0][0] == "what?"
+
+
+def test_a_slow_query_does_not_block_the_event_loop():
+    """``/query`` performs blocking network I/O.
+
+    If it is declared ``async def`` it runs on the event loop and every other
+    request in the process — health probes included — waits behind it.
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowService(StubService):
+        def answer(self, question, top_k=None):
+            started.set()
+            release.wait(timeout=SLOW_QUERY_SECONDS)
+            return self.result
+
+    service = SlowService()
+    app.dependency_overrides[get_settings] = lambda: make_settings()
+    app.dependency_overrides[get_retrieval_service] = lambda: service
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            begun = time.monotonic()
+            slow = asyncio.ensure_future(client.post("/query", json={"question": "q"}))
+            for _ in range(300):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set(), "the request never reached the retrieval service"
+
+            health = await client.get("/health")
+            # The event loop stayed responsive while the query was in flight;
+            # a blocking `async def` endpoint would only let us get here after
+            # SLOW_QUERY_SECONDS.
+            elapsed = time.monotonic() - begun
+            release.set()
+            return health, elapsed, await slow
+
+    health, elapsed, slow = asyncio.run(scenario())
+    assert health.status_code == 200
+    assert slow.status_code == 200
+    assert elapsed < SLOW_QUERY_SECONDS, (
+        f"/health took {elapsed:.2f}s while /query was running; the event loop was blocked"
+    )
 
 
 def test_query_requires_a_token_when_auth_is_enabled():

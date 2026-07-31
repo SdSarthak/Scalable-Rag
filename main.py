@@ -5,7 +5,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
@@ -24,8 +24,19 @@ ERROR_COUNT = Counter("query_errors_total", "Total failed query requests", ["rea
 QUERY_LATENCY = Histogram("query_latency_seconds", "End-to-end query latency in seconds")
 
 
+#: Hard ceiling on the request body's question field. ``MAX_QUESTION_LENGTH``
+#: is the configurable limit; this one exists so an absurd payload is rejected
+#: by the parser instead of being loaded, decoded and validated first.
+MAX_QUESTION_CHARS = 32_000
+
+
 class QueryRequest(BaseModel):
-    question: str = Field(..., min_length=1, description="Natural-language question")
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_QUESTION_CHARS,
+        description="Natural-language question",
+    )
     top_k: Optional[int] = Field(
         None, ge=1, le=50, description="Override how many chunks are retrieved"
     )
@@ -85,12 +96,20 @@ async def add_process_time_header(request: Request, call_next):
 
 
 @app.post("/query", response_model=QueryResponse)
-async def query(
+def query(
     request: QueryRequest,
+    background: BackgroundTasks,
     principal: Principal = Depends(validate_token),
     service: RetrievalService = Depends(get_retrieval_service),
     settings: Settings = Depends(get_settings),
 ) -> QueryResponse:
+    """Answer a question from the indexed corpus.
+
+    Declared ``def`` rather than ``async def`` on purpose: ``service.answer``
+    makes blocking HTTP calls to the embedding and chat endpoints. On the event
+    loop those calls stalled every other request in the process — including the
+    liveness probe, which is how a busy pod got itself restarted.
+    """
     REQUEST_COUNT.inc()
     started = time.perf_counter()
     try:
@@ -111,7 +130,10 @@ async def query(
     finally:
         QUERY_LATENCY.observe(time.perf_counter() - started)
 
-    log_query(
+    # Tracing runs after the response is sent so a slow tracking server never
+    # shows up in the caller's latency.
+    background.add_task(
+        log_query,
         request.question,
         result["answer"],
         result["sources"],
