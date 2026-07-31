@@ -2,7 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # This repository's default branch is master; listing only main meant no
+    # push ever triggered a build.
+    branches: [main, master]
   pull_request:
 
 jobs:
