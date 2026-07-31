@@ -4,6 +4,7 @@ The heavy dependencies (faiss, the embedding client) are imported lazily so the
 API process and the test suite can import this module without them.
 """
 
+import inspect
 import logging
 import os
 from typing import List, Optional
@@ -56,24 +57,59 @@ def create_vector_store(
     return vector_store
 
 
-def index_exists(settings: Optional[Settings] = None) -> bool:
+#: ``FAISS.save_local`` writes both of these. An index missing either one is
+#: unusable, so both have to be present before we report the service ready.
+INDEX_FILES = ("index.faiss", "index.pkl")
+
+
+def missing_index_files(settings: Optional[Settings] = None) -> List[str]:
+    """Return the index artefacts that are absent from ``INDEX_PATH``."""
     settings = settings or get_settings()
-    return os.path.isfile(os.path.join(settings.index_path, "index.faiss"))
+    return [
+        name
+        for name in INDEX_FILES
+        if not os.path.isfile(os.path.join(settings.index_path, name))
+    ]
+
+
+def index_exists(settings: Optional[Settings] = None) -> bool:
+    """True only when a *complete* index is on disk.
+
+    Checking ``index.faiss`` alone made ``/ready`` claim the pod could serve
+    traffic while a half-written index (no ``index.pkl``) blew up on the first
+    query, so Kubernetes routed requests straight into 502s.
+    """
+    return not missing_index_files(settings)
+
+
+def _load_local(settings: Settings, embeddings):
+    faiss = _faiss()
+    try:
+        parameters = inspect.signature(faiss.load_local).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtin//C callable
+        parameters = {}
+    if "allow_dangerous_deserialization" in parameters:
+        return faiss.load_local(
+            settings.index_path, embeddings, allow_dangerous_deserialization=True
+        )
+    return faiss.load_local(settings.index_path, embeddings)  # pragma: no cover
 
 
 def load_vector_store(settings: Optional[Settings] = None):
     """Load the persisted FAISS index from disk."""
     settings = settings or get_settings()
-    if not index_exists(settings):
+    missing = missing_index_files(settings)
+    if missing:
         raise VectorStoreNotFound(
-            f"no FAISS index at {os.path.abspath(settings.index_path)}; "
-            "build one with `python ingest.py`"
+            f"incomplete FAISS index at {os.path.abspath(settings.index_path)} "
+            f"(missing {', '.join(missing)}); build one with `python ingest.py`"
         )
 
     embeddings = get_embeddings(settings)
     try:
-        return _faiss().load_local(
-            settings.index_path, embeddings, allow_dangerous_deserialization=True
-        )
-    except TypeError:  # pragma: no cover - langchain < 0.1.x has no such flag
-        return _faiss().load_local(settings.index_path, embeddings)
+        return _load_local(settings, embeddings)
+    except Exception as exc:  # corrupt, truncated or embedding-mismatched index
+        raise VectorStoreNotFound(
+            f"the FAISS index at {os.path.abspath(settings.index_path)} could not be "
+            f"loaded ({type(exc).__name__}: {exc}); rebuild it with `python ingest.py`"
+        ) from exc

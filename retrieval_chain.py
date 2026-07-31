@@ -7,14 +7,20 @@ when the corpus has not been indexed yet.
 """
 
 import logging
+import threading
 import time
+from collections import OrderedDict
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-from config import Settings, get_settings
+from config import ConfigError, Settings, get_settings
 from vector_store import VectorStoreNotFound, index_exists, load_vector_store
 
 logger = logging.getLogger(__name__)
+
+#: Each cached chain pins a retriever and an LLM client, and ``top_k`` comes
+#: from the caller, so the cache is bounded and evicted least-recently-used.
+MAX_CACHED_CHAINS = 8
 
 PROMPT_TEMPLATE = """You are a retrieval assistant. Answer the question using only the
 context below. If the context does not contain the answer, say that you do not know
@@ -68,7 +74,11 @@ class RetrievalService:
     def __init__(self, settings: Optional[Settings] = None, chain: Any = None):
         self.settings = settings or get_settings()
         self._vector_store = None
-        self._chains: Dict[int, Any] = {}
+        self._chains: "OrderedDict[int, Any]" = OrderedDict()
+        # Requests are served from a thread pool, so building the index and the
+        # chains has to be serialised: without this two concurrent first
+        # requests each load the whole FAISS index into memory.
+        self._lock = threading.RLock()
         if chain is not None:
             self._chains[self.settings.retrieval_k] = chain
 
@@ -76,7 +86,9 @@ class RetrievalService:
     @property
     def vector_store(self):
         if self._vector_store is None:
-            self._vector_store = load_vector_store(self.settings)
+            with self._lock:
+                if self._vector_store is None:
+                    self._vector_store = load_vector_store(self.settings)
         return self._vector_store
 
     def _build_chain(self, top_k: int):
@@ -95,12 +107,25 @@ class RetrievalService:
         )
 
     def chain_for(self, top_k: Optional[int] = None):
-        top_k = top_k or self.settings.retrieval_k
+        if top_k is None:
+            top_k = self.settings.retrieval_k
+        if not isinstance(top_k, int) or isinstance(top_k, bool):
+            raise ValueError("top_k must be an integer")
         if top_k <= 0:
+            # ``top_k or default`` used to silently turn 0 into the default.
             raise ValueError("top_k must be greater than zero")
-        if top_k not in self._chains:
-            self._chains[top_k] = self._build_chain(top_k)
-        return self._chains[top_k]
+
+        with self._lock:
+            chain = self._chains.get(top_k)
+            if chain is None:
+                chain = self._build_chain(top_k)
+                self._chains[top_k] = chain
+                while len(self._chains) > MAX_CACHED_CHAINS:
+                    evicted, _ = self._chains.popitem(last=False)
+                    logger.debug("evicted cached chain for top_k=%s", evicted)
+            else:
+                self._chains.move_to_end(top_k)
+            return chain
 
     def warmup(self) -> bool:
         """Pre-load the index and the default chain. Returns True on success."""
@@ -115,7 +140,20 @@ class RetrievalService:
             return False
 
     def is_ready(self) -> bool:
-        return bool(self._chains) or index_exists(self.settings)
+        """Readiness means a query would actually succeed.
+
+        A complete index on disk is not enough: without an API key every query
+        fails with a 503, so a pod deployed with a missing secret must never
+        pass its readiness probe and start taking traffic.
+        """
+        if self._chains:
+            return True
+        try:
+            self.settings.require_llm()
+        except ConfigError as exc:
+            logger.warning("not ready: %s", exc)
+            return False
+        return index_exists(self.settings)
 
     # --- querying --------------------------------------------------------
     def answer(self, question: str, top_k: Optional[int] = None) -> Dict[str, Any]:
