@@ -5,31 +5,63 @@ not installed must never turn a successful answer into a failed request.
 """
 
 import logging
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
+#: How long tracing stays switched off after a failure. Without this a dead
+#: tracking server is re-contacted on every single query and its connection
+#: timeout is added to each answer's latency.
+FAILURE_BACKOFF_SECONDS = 60.0
+
+_lock = threading.Lock()
 _configured = False
+_suspended_until = 0.0
+
+
+def _suspend(reason: str, exc: Exception) -> None:
+    """Switch tracing off for a while after a failure."""
+    global _suspended_until
+    _suspended_until = time.monotonic() + FAILURE_BACKOFF_SECONDS
+    logger.warning(
+        "mlflow %s (%s); tracing suspended for %.0fs",
+        reason,
+        exc,
+        FAILURE_BACKOFF_SECONDS,
+    )
 
 
 def _mlflow(settings: Settings):
-    """Return a configured mlflow module, or ``None`` when tracing is off."""
+    """Return a configured mlflow module, or ``None`` when tracing is off.
+
+    Never raises: configuring MLflow can talk to the tracking server, and a
+    server that is down must not turn a good answer into a failed request.
+    """
     global _configured
     if not settings.mlflow_enabled:
         return None
+    if time.monotonic() < _suspended_until:
+        return None
     try:
         import mlflow
-    except ImportError:
-        logger.warning("MLFLOW_ENABLED is set but mlflow is not installed; skipping tracing")
+    except ImportError as exc:
+        _suspend("is not installed", exc)
         return None
 
-    if not _configured:
-        if settings.mlflow_tracking_uri:
-            mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-        mlflow.set_experiment(settings.mlflow_experiment)
-        _configured = True
+    with _lock:
+        if not _configured:
+            try:
+                if settings.mlflow_tracking_uri:
+                    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+                mlflow.set_experiment(settings.mlflow_experiment)
+            except Exception as exc:  # unreachable/misconfigured tracking server
+                _suspend("could not be configured", exc)
+                return None
+            _configured = True
     return mlflow
 
 
@@ -60,7 +92,7 @@ def log_query(
             mlflow.log_text("\n".join(_source_names(sources)), "sources.txt")
         return True
     except Exception as exc:  # tracing must never break the request path
-        logger.warning("mlflow logging failed: %s", exc)
+        _suspend("logging failed", exc)
         return False
 
 
@@ -76,6 +108,7 @@ def _source_names(sources: List[Any]) -> List[str]:
 
 
 def reset_tracing_state() -> None:
-    """Forget that the tracking URI/experiment were configured (used by tests)."""
-    global _configured
+    """Forget the configuration and any failure backoff (used by tests)."""
+    global _configured, _suspended_until
     _configured = False
+    _suspended_until = 0.0
