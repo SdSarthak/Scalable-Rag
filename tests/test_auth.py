@@ -4,8 +4,11 @@ import jwt
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import ValidationError
 
+import auth
 from auth import ANONYMOUS_SUBJECT, decode_token, validate_token
+from config import ConfigError
 from conftest import make_settings
 
 SECRET = "unit-test-secret"
@@ -89,3 +92,68 @@ def test_misconfigured_auth_fails_closed_with_500():
 def test_disabled_auth_returns_anonymous():
     settings = make_settings(auth_enabled=False)
     assert validate_token(None, settings).subject == ANONYMOUS_SUBJECT
+
+
+def test_a_token_without_an_expiry_is_rejected():
+    """PyJWT only checks `exp` when present, so it has to be required."""
+    settings = make_settings(auth_enabled=True, jwt_secret=SECRET)
+    forever = jwt.encode({"sub": "user-123"}, SECRET, algorithm="HS256")
+    with pytest.raises(HTTPException) as excinfo:
+        validate_token(bearer(forever), settings)
+    assert excinfo.value.status_code == 401
+
+
+def test_a_non_bearer_scheme_is_rejected():
+    settings = make_settings(auth_enabled=True, jwt_secret=SECRET)
+    credentials = HTTPAuthorizationCredentials(scheme="Basic", credentials=make_token())
+    with pytest.raises(HTTPException) as excinfo:
+        validate_token(credentials, settings)
+    assert excinfo.value.status_code == 401
+
+
+def test_issuer_is_enforced_when_configured():
+    settings = make_settings(auth_enabled=True, jwt_secret=SECRET, jwt_issuer="https://idp")
+    with pytest.raises(HTTPException):
+        validate_token(bearer(make_token(iss="https://evil")), settings)
+    assert validate_token(bearer(make_token(iss="https://idp")), settings).subject == "user-123"
+
+
+def test_the_none_algorithm_cannot_be_configured():
+    """`alg=none` with an empty key makes PyJWT accept unsigned tokens."""
+    with pytest.raises(ValidationError):
+        make_settings(jwt_algorithm="none")
+
+
+def test_unknown_algorithms_are_rejected_at_startup():
+    with pytest.raises(ValidationError):
+        make_settings(jwt_algorithm="HS257")
+
+
+def test_algorithms_are_normalised():
+    assert make_settings(jwt_algorithm=" rs256 ").jwt_algorithm == "RS256"
+
+
+def test_asymmetric_algorithms_require_a_jwks_url():
+    settings = make_settings(auth_enabled=True, jwt_algorithm="ES256", jwt_secret="x")
+    with pytest.raises(ConfigError):
+        settings.require_auth()
+
+    settings = make_settings(
+        auth_enabled=True, jwt_algorithm="PS256", jwt_jwks_url="https://idp/.well-known/jwks"
+    )
+    settings.require_auth()  # does not raise
+
+
+def test_a_jwks_lookup_failure_fails_closed(monkeypatch):
+    settings = make_settings(
+        auth_enabled=True, jwt_algorithm="RS256", jwt_jwks_url="https://idp/jwks"
+    )
+
+    class BrokenClient:
+        def get_signing_key_from_jwt(self, token):
+            raise OSError("connection refused")
+
+    monkeypatch.setattr(auth, "_jwks_client", lambda url: BrokenClient())
+    with pytest.raises(HTTPException) as excinfo:
+        decode_token(make_token(), settings)
+    assert excinfo.value.status_code == 401

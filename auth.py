@@ -44,18 +44,26 @@ def _unauthorized(detail: str) -> HTTPException:
     )
 
 
+#: Cap on the JWKS fetch. PyJWT defaults to 30s, which is long enough for an
+#: unreachable identity provider to pin a request worker for half a minute.
+JWKS_TIMEOUT_SECONDS = 5
+
+
 @lru_cache(maxsize=4)
 def _jwks_client(url: str):
-    return jwt.PyJWKClient(url, cache_keys=True)
+    return jwt.PyJWKClient(url, cache_keys=True, timeout=JWKS_TIMEOUT_SECONDS)
 
 
 def _signing_key(token: str, settings: Settings) -> str:
-    if settings.jwt_algorithm.upper().startswith("HS"):
+    if settings.jwt_is_symmetric:
         return settings.jwt_secret
     try:
         return _jwks_client(settings.jwt_jwks_url).get_signing_key_from_jwt(token).key
     except jwt.PyJWKClientError as exc:
         logger.warning("unable to resolve signing key: %s", exc)
+        raise _unauthorized("token signing key could not be resolved") from exc
+    except Exception as exc:  # network/TLS failures must fail closed, not 500
+        logger.warning("jwks lookup failed: %s", exc)
         raise _unauthorized("token signing key could not be resolved") from exc
 
 
@@ -73,6 +81,9 @@ def decode_token(token: str, settings: Settings) -> Principal:
     options = {
         "verify_aud": bool(settings.jwt_audience),
         "verify_iss": bool(settings.jwt_issuer),
+        # PyJWT only checks `exp` when it is present, so a token minted without
+        # one would be accepted forever. Bearer tokens have to expire.
+        "require": ["exp"],
     }
     try:
         claims = jwt.decode(

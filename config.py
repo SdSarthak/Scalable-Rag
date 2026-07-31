@@ -15,6 +15,25 @@ class ConfigError(RuntimeError):
     """Raised when the runtime configuration is incomplete or inconsistent."""
 
 
+#: Algorithms the service will verify tokens with. ``none`` is deliberately
+#: absent: with an empty key PyJWT happily accepts unsigned tokens, so a typo
+#: in JWT_ALGORITHM must stop the process rather than open the door.
+SUPPORTED_JWT_ALGORITHMS = (
+    "HS256",
+    "HS384",
+    "HS512",
+    "RS256",
+    "RS384",
+    "RS512",
+    "ES256",
+    "ES384",
+    "ES512",
+    "PS256",
+    "PS384",
+    "PS512",
+)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -89,6 +108,17 @@ class Settings(BaseSettings):
             raise ValueError("value must be greater than zero")
         return value
 
+    @field_validator("jwt_algorithm")
+    @classmethod
+    def _check_algorithm(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized not in SUPPORTED_JWT_ALGORITHMS:
+            raise ValueError(
+                f"unsupported jwt_algorithm {value!r}; expected one of "
+                f"{', '.join(SUPPORTED_JWT_ALGORITHMS)}"
+            )
+        return normalized
+
     @field_validator("max_document_mb")
     @classmethod
     def _check_non_negative(cls, value: int) -> int:
@@ -131,14 +161,24 @@ class Settings(BaseSettings):
         if self.document_source == "s3" and not self.s3_bucket_name:
             raise ConfigError("S3_BUCKET_NAME is required when DOCUMENT_SOURCE=s3")
 
+    @property
+    def jwt_is_symmetric(self) -> bool:
+        return self.jwt_algorithm.startswith("HS")
+
     def require_auth(self) -> None:
         if not self.auth_enabled:
             return
-        algorithm = self.jwt_algorithm.upper()
-        if algorithm.startswith("HS") and not self.jwt_secret:
-            raise ConfigError("JWT_SECRET is required for symmetric (HS*) token validation")
-        if algorithm.startswith("RS") and not self.jwt_jwks_url:
-            raise ConfigError("JWT_JWKS_URL is required for asymmetric (RS*) token validation")
+        if self.jwt_is_symmetric:
+            if not self.jwt_secret:
+                raise ConfigError(
+                    "JWT_SECRET is required for symmetric (HS*) token validation"
+                )
+        elif not self.jwt_jwks_url:
+            # RS*, ES* and PS* all resolve their key from the issuer's JWKS.
+            raise ConfigError(
+                f"JWT_JWKS_URL is required for asymmetric ({self.jwt_algorithm}) "
+                "token validation"
+            )
 
 
 @lru_cache(maxsize=1)

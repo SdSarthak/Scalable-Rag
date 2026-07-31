@@ -116,7 +116,7 @@ touch:
 | `INDEX_PATH` | `faiss_index` | Where the FAISS index is written |
 | `RETRIEVAL_K` | `5` | Chunks fed to the model per question |
 | `AUTH_ENABLED` | `true` | Set `false` for local development only |
-| `JWT_ALGORITHM` | `HS256` | `HS*` uses `JWT_SECRET`, `RS*` uses `JWT_JWKS_URL` |
+| `JWT_ALGORITHM` | `HS256` | `HS*` uses `JWT_SECRET`; `RS*`/`ES*`/`PS*` use `JWT_JWKS_URL` |
 | `MLFLOW_ENABLED` | `false` | Trace queries to `MLFLOW_TRACKING_URI` |
 
 ## Tests
@@ -156,3 +156,7 @@ are already on the pod template.
 - Prefer an IAM role for the service account over static AWS keys on EKS.
 - `AUTH_ENABLED=true` fails closed: a misconfigured validator returns `500`
   rather than letting requests through.
+- Bearer tokens must carry an `exp` claim — one without an expiry is rejected
+  rather than accepted forever.
+- `JWT_ALGORITHM` is checked against an allow-list at startup. `none` and typos
+  stop the process instead of silently weakening verification.
