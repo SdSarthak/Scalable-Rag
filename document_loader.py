@@ -5,6 +5,8 @@ from an S3 prefix (the production path). Both loaders return LangChain
 ``Document`` objects that are then split into overlapping chunks.
 """
 
+import codecs
+import contextlib
 import io
 import logging
 import os
@@ -38,13 +40,27 @@ def _read_pdf(payload: bytes) -> str:
     return "\n".join((page.extract_text() or "") for page in reader.pages)
 
 
+def decode_text(payload: bytes) -> str:
+    """Decode text bytes, honouring the byte-order marks Windows editors add.
+
+    ``bytes.decode("utf-8")`` keeps a UTF-8 BOM as a literal ``\\ufeff`` at the
+    start of the document and turns UTF-16 into interleaved NUL characters,
+    both of which end up embedded in the index.
+    """
+    if payload.startswith(codecs.BOM_UTF8):
+        return payload[len(codecs.BOM_UTF8) :].decode("utf-8", errors="replace")
+    if payload.startswith(codecs.BOM_UTF16_LE) or payload.startswith(codecs.BOM_UTF16_BE):
+        return payload.decode("utf-16", errors="replace")
+    return payload.decode("utf-8", errors="replace")
+
+
 def parse_document(name: str, payload: bytes, source: str) -> Optional[Document]:
     """Turn raw bytes into a ``Document``; returns ``None`` when it is empty."""
     extension = os.path.splitext(name)[1].lower()
     if extension == ".pdf":
         text = _read_pdf(payload)
     else:
-        text = payload.decode("utf-8", errors="replace")
+        text = decode_text(payload)
     text = text.strip()
     if not text:
         logger.warning("skipping empty document: %s", source)
@@ -55,8 +71,23 @@ def parse_document(name: str, payload: bytes, source: str) -> Optional[Document]
     )
 
 
+def _too_large(size: int, settings: Settings, source: str) -> bool:
+    limit = settings.max_document_bytes
+    if limit and size > limit:
+        logger.warning(
+            "skipping %s: %d bytes exceeds MAX_DOCUMENT_MB (%d bytes)", source, size, limit
+        )
+        return True
+    return False
+
+
 def load_local_documents(settings: Optional[Settings] = None) -> List[Document]:
-    """Read every supported file below ``DOCS_DIR``."""
+    """Read every supported file below ``DOCS_DIR``.
+
+    A single unreadable or corrupt file is skipped with a warning rather than
+    aborting the whole ingest — one bad PDF in a corpus of ten thousand should
+    not cost you the other 9,999.
+    """
     settings = settings or get_settings()
     root = settings.docs_dir
     if not os.path.isdir(root):
@@ -64,21 +95,36 @@ def load_local_documents(settings: Optional[Settings] = None) -> List[Document]:
 
     allowed = set(settings.allowed_extensions)
     documents: List[Document] = []
+    skipped = 0
     for dirpath, _dirnames, filenames in os.walk(root):
         for filename in sorted(filenames):
             if os.path.splitext(filename)[1].lower() not in allowed:
                 continue
             path = os.path.join(dirpath, filename)
-            with open(path, "rb") as handle:
-                document = parse_document(filename, handle.read(), source=path)
+            try:
+                if _too_large(os.path.getsize(path), settings, path):
+                    skipped += 1
+                    continue
+                with open(path, "rb") as handle:
+                    payload = handle.read()
+                document = parse_document(filename, payload, source=path)
+            except DocumentLoadError:
+                raise  # a missing parser is a setup problem, not a bad file
+            except Exception as exc:
+                logger.warning("skipping unreadable document %s: %s", path, exc)
+                skipped += 1
+                continue
             if document is not None:
                 documents.append(document)
 
     if not documents:
         raise DocumentLoadError(
-            f"no documents with extensions {sorted(allowed)} found under {os.path.abspath(root)}"
+            f"no readable documents with extensions {sorted(allowed)} found under "
+            f"{os.path.abspath(root)} ({skipped} skipped)"
         )
-    logger.info("loaded %d local documents from %s", len(documents), root)
+    logger.info(
+        "loaded %d local documents from %s (%d skipped)", len(documents), root, skipped
+    )
     return documents
 
 
@@ -93,40 +139,80 @@ def load_s3_documents(settings: Optional[Settings] = None, client=None) -> List[
         client = boto3.client("s3", region_name=settings.aws_region)
 
     allowed = set(settings.allowed_extensions)
+    bucket = settings.s3_bucket_name
     documents: List[Document] = []
-    for key in _iter_s3_keys(client, settings.s3_bucket_name, settings.s3_prefix):
-        if os.path.splitext(key)[1].lower() not in allowed:
-            continue
-        body = client.get_object(Bucket=settings.s3_bucket_name, Key=key)["Body"].read()
-        document = parse_document(key, body, source=f"s3://{settings.s3_bucket_name}/{key}")
-        if document is not None:
-            documents.append(document)
+    skipped = 0
+    try:
+        for key, size in _iter_s3_keys(client, bucket, settings.s3_prefix):
+            if os.path.splitext(key)[1].lower() not in allowed:
+                continue
+            source = f"s3://{bucket}/{key}"
+            if _too_large(size, settings, source):
+                skipped += 1
+                continue
+            try:
+                document = parse_document(key, _read_object(client, bucket, key), source=source)
+            except DocumentLoadError:
+                raise
+            except Exception as exc:
+                logger.warning("skipping unreadable object %s: %s", source, exc)
+                skipped += 1
+                continue
+            if document is not None:
+                documents.append(document)
+    except DocumentLoadError:
+        raise
+    except Exception as exc:  # listing failed: missing bucket, denied, no creds
+        raise DocumentLoadError(
+            f"could not list s3://{bucket}/{settings.s3_prefix} "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
 
     if not documents:
         raise DocumentLoadError(
-            f"no documents found in s3://{settings.s3_bucket_name}/{settings.s3_prefix}"
+            f"no readable documents found in s3://{bucket}/{settings.s3_prefix} "
+            f"({skipped} skipped)"
         )
-    logger.info("loaded %d documents from s3://%s", len(documents), settings.s3_bucket_name)
+    logger.info(
+        "loaded %d documents from s3://%s (%d skipped)", len(documents), bucket, skipped
+    )
     return documents
 
 
-def _iter_s3_keys(client, bucket: str, prefix: str) -> Iterable[str]:
-    """Yield object keys, transparently following pagination."""
+def _read_object(client, bucket: str, key: str) -> bytes:
+    """Read an object, always releasing the underlying connection."""
+    body = client.get_object(Bucket=bucket, Key=key)["Body"]
+    try:
+        return body.read()
+    finally:
+        with contextlib.suppress(Exception):
+            body.close()
+
+
+def _iter_s3_keys(client, bucket: str, prefix: str) -> Iterable[tuple]:
+    """Yield ``(key, size)`` pairs, transparently following pagination."""
     token = None
+    seen = set()
     while True:
         kwargs = {"Bucket": bucket, "Prefix": prefix}
         if token:
             kwargs["ContinuationToken"] = token
         response = client.list_objects_v2(**kwargs)
         for item in response.get("Contents", []):
-            key = item["Key"]
-            if not key.endswith("/"):
-                yield key
+            key = item.get("Key")
+            if not key or key.endswith("/"):
+                continue
+            if key in seen:  # a repeated continuation token would loop forever
+                logger.warning("s3 listing returned %s twice; stopping", key)
+                return
+            seen.add(key)
+            yield key, int(item.get("Size") or 0)
         if not response.get("IsTruncated"):
             return
-        token = response.get("NextContinuationToken")
-        if not token:
+        next_token = response.get("NextContinuationToken")
+        if not next_token or next_token == token:
             return
+        token = next_token
 
 
 def split_documents(

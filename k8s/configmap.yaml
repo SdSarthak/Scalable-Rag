@@ -11,6 +11,7 @@ data:
   AWS_REGION: "us-east-1"
   CHUNK_SIZE: "1000"
   CHUNK_OVERLAP: "200"
+  MAX_DOCUMENT_MB: "25"
   INDEX_PATH: "/app/faiss_index"
   RETRIEVAL_K: "5"
   AUTH_ENABLED: "true"

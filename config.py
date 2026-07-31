@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     aws_region: str = "us-east-1"
     chunk_size: int = 1000
     chunk_overlap: int = 200
+    #: Per-document ceiling; each file is read into memory whole, so without a
+    #: cap a single huge object can OOM the ingest job. 0 disables the check.
+    max_document_mb: int = 25
 
     # --- retrieval -------------------------------------------------------
     index_path: str = "faiss_index"
@@ -86,6 +89,13 @@ class Settings(BaseSettings):
             raise ValueError("value must be greater than zero")
         return value
 
+    @field_validator("max_document_mb")
+    @classmethod
+    def _check_non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_document_mb cannot be negative")
+        return value
+
     @model_validator(mode="after")
     def _check_overlap(self) -> "Settings":
         if self.chunk_overlap < 0:
@@ -106,6 +116,11 @@ class Settings(BaseSettings):
             for item in self.document_extensions.split(",")
             if item.strip()
         ]
+
+    @property
+    def max_document_bytes(self) -> int:
+        """The per-document size cap in bytes; 0 means unlimited."""
+        return self.max_document_mb * 1024 * 1024
 
     def require_llm(self) -> None:
         """Fail fast when the model provider is not configured."""

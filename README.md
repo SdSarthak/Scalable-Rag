@@ -112,6 +112,7 @@ touch:
 | `DOCUMENT_SOURCE` | `local` | `local` or `s3` |
 | `DOCS_DIR` / `S3_BUCKET_NAME` | `docs` / — | Where the corpus lives |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1000` / `200` | Splitter geometry |
+| `MAX_DOCUMENT_MB` | `25` | Ingestion skips larger documents; `0` disables the cap |
 | `INDEX_PATH` | `faiss_index` | Where the FAISS index is written |
 | `RETRIEVAL_K` | `5` | Chunks fed to the model per question |
 | `AUTH_ENABLED` | `true` | Set `false` for local development only |
